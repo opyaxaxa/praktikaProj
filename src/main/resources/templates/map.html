@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="ru" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <title>Карта курьеров</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            overflow: hidden;
+        }
+
+        .map-container {
+            position: fixed;
+            top: 5vh;
+            left: 5vw;
+            width: 90vw;
+            height: 90vh;
+            background: #f6f050;
+            padding: 10px;
+            box-sizing: border-box;
+        }
+
+        #map {
+            width: 100%;
+            height: 100%;
+            border: 2px solid #333;
+        }
+
+        .order-panel {
+            position: fixed;
+            top: 10vh;
+            right: 5vw;
+            width: 300px;
+            background: white;
+            padding: 20px;
+            box-shadow: 0 0 15px rgba(0,0,0,0.2);
+            z-index: 1000;
+            border-radius: 8px;
+        }
+
+        .route-info {
+            position: fixed;
+            bottom: 10vh;
+            left: 5vw;
+            background: white;
+            padding: 15px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.15);
+            border-radius: 6px;
+            min-width: 250px;
+        }
+    </style>
+</head>
+<body>
+<div class="map-container">
+    <button id="openOrderPanel" style="position: absolute; top: 20px; right: 20px; z-index: 1001;">
+        Создать заказ
+    </button>
+    <div id="map"></div>
+
+    <div class="order-panel" id="orderPanel" style="display: none;">
+        <h3>Новый заказ</h3>
+        <form id="orderForm">
+            <input type="text" id="startAddress" placeholder="Откуда" required>
+            <input type="text" id="endAddress" placeholder="Куда" required>
+            <input type="number" id="weight" placeholder="Вес (кг)" step="0.1" required>
+            <button type="submit">Оформить заказ</button>
+        </form>
+    </div>
+
+    <div class="route-info" id="routeInfo" style="display: none;">
+        <h4>Заказ #<span id="orderId"></span></h4>
+        <p>Статус: <span id="orderStatus"></span></p>
+        <p>Примерное время: <span id="eta"></span></p>
+    </div>
+</div>
+
+<script src="https://api-maps.yandex.ru/2.1/?apikey=b9c44ebd-f079-45a5-a676-05dd9a570b1b&lang=ru_RU"></script>
+<script>
+    ymaps.ready(init);
+
+    let map;
+    let userPlacemark;
+    const courierPlacemarks = {};
+    const defaultCoords = [51.818901, 55.144207];
+    let userInteraction = false;
+    let interactionTimeout;
+    let orderRoute;
+    let orderObjects = {};
+
+    function init() {
+        if (navigator.geolocation) {
+            navigator.geolocation.getCurrentPosition(
+                userPositionSuccess,
+                userPositionError,
+                { enableHighAccuracy: true, timeout: 10000 }
+            );
+        } else {
+            console.error('Геолокация не поддерживается браузером');
+            initializeMap(defaultCoords);
+            startCourierUpdates();
+        }
+    }
+
+    document.getElementById('orderForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+
+        const orderData = {
+            start: document.getElementById('startAddress').value,
+            end: document.getElementById('endAddress').value,
+            weight: parseFloat(document.getElementById('weight').value)
+        };
+
+        try {
+            const response = await fetch('/api/orders', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(orderData)
+            });
+
+            if (response.ok) {
+                const order = await response.json();
+                addOrderToMap(order);
+                document.getElementById('orderPanel').style.display = 'none';
+            }
+        } catch (error) {
+            console.error('Ошибка создания заказа:', error);
+        }
+    });
+
+    function userPositionSuccess(position) {
+        const userCoords = [
+            position.coords.latitude,
+            position.coords.longitude
+        ];
+        initializeMap(userCoords);
+        createUserMarker(userCoords);
+        startCourierUpdates();
+    }
+
+    function userPositionError(error) {
+        console.error('Ошибка геолокации:', error);
+        initializeMap(defaultCoords);
+        startCourierUpdates();
+    }
+
+    function initializeMap(centerCoords) {
+        if (map) map.destroy();
+
+        map = new ymaps.Map("map", {
+            center: centerCoords,
+            zoom: 13,
+            controls: ['zoomControl', 'fullscreenControl']
+        });
+
+        map.events.add(['actionend', 'wheel'], () => {
+            userInteraction = true;
+            resetInteractionTimeout();
+        });
+
+        window.addEventListener('resize', () => {
+            map.container.fitToViewport();
+        });
+    }
+
+    function resetInteractionTimeout() {
+        clearTimeout(interactionTimeout);
+        interactionTimeout = setTimeout(() => {
+            userInteraction = false;
+        }, 30000);
+    }
+
+    function createUserMarker(coords) {
+        userPlacemark = new ymaps.Placemark(coords, {
+            hintContent: 'Ваше местоположение',
+            balloonContent: 'Приблизительная позиция'
+        }, {
+            preset: 'islands#blueCircleIcon',
+            iconColor: '#1e98ff'
+        });
+        map.geoObjects.add(userPlacemark);
+    }
+
+    function processCouriers(couriers) {
+        console.log("Получены курьеры:", couriers);
+
+        Object.keys(courierPlacemarks).forEach(id => {
+            if (!couriers.some(c => c.id.toString() === id)) {
+                map.geoObjects.remove(courierPlacemarks[id]);
+                delete courierPlacemarks[id];
+            }
+        });
+
+        couriers.forEach(courier => {
+            const coords = [courier.latitude, courier.longitude];
+            console.log(`Курьер ${courier.id}: ${coords}`);
+            updateCourierMarker(courier.id.toString(), coords, courier);
+        });
+    }
+
+    function startCourierUpdates() {
+        updateCourierPositions();
+        setInterval(updateCourierPositions, 5000);
+    }
+
+    function updateCourierPositions() {
+        fetch('/api/positions')
+            .then(response => response.json())
+            .then(couriers => {
+                processCouriers(couriers);
+                if (!userInteraction) {
+                    adjustMapView(couriers);
+                }
+            })
+            .catch(console.error);
+    }
+
+    function updateCourierMarker(courierId, coords, courier) {
+        if (!courierPlacemarks[courierId]) {
+            courierPlacemarks[courierId] = new ymaps.Placemark(coords, {
+                hintContent: `Курьер #${courierId}`,
+                balloonContent: `
+                <b>Курьер ${courierId}</b><br>
+                Последнее обновление: ${new Date().toLocaleTimeString()}
+            `
+            }, {
+                preset: 'islands#redDeliveryIcon',
+                iconColor: '#ff0000'
+            });
+            map.geoObjects.add(courierPlacemarks[courierId]);
+        } else {
+            courierPlacemarks[courierId].geometry.setCoordinates(coords);
+            courierPlacemarks[courierId].properties.set({
+                balloonContent: `
+                <b>Курьер ${courierId}</b><br>
+                Последнее обновление: ${new Date().toLocaleTimeString()}
+            `
+            });
+        }
+        if (courier.assignedOrder) {
+            buildRoute(courier.assignedOrder);
+        }
+    }
+
+    function adjustMapView(couriers) {
+        const allCoords = couriers.map(c => [c.latitude, c.longitude]);
+        if (userPlacemark) {
+            allCoords.push(userPlacemark.geometry.getCoordinates());
+        }
+
+        if (allCoords.length > 0) {
+            const bounds = ymaps.util.bounds.fromPoints(allCoords);
+            map.setBounds(bounds, {
+                checkZoomRange: true,
+                zoomMargin: 50
+            });
+        }
+    }
+
+    function addOrderToMap(order) {
+        const startPoint = new ymaps.Placemark(
+            [order.startLat, order.startLon],
+            {hintContent: 'Точка отправления'},
+            {preset: 'islands#greenDotIcon'}
+        );
+
+        const endPoint = new ymaps.Placemark(
+            [order.endLat, order.endLon],
+            {hintContent: 'Точка доставки'},
+            {preset: 'islands#redDotIcon'}
+        );
+
+        orderObjects[order.id] = {startPoint, endPoint};
+        map.geoObjects.add(startPoint).add(endPoint);
+
+        if (order.courierId) {
+            buildRoute(order);
+        }
+    }
+
+    async function buildRoute(order) {
+        if (!order.courierId || !courierPlacemarks[order.courierId]) {
+            console.warn('Курьер не найден для заказа:', order.id);
+            return;
+        }
+        const courierCoords = courierPlacemarks[order.courierId].geometry.getCoordinates();
+        const endCoords = [order.endLat, order.endLon];
+
+        const route = await ymaps.route([courierCoords, endCoords], {
+            mapStateAutoApply: true
+        });
+
+        orderRoute = route;
+        map.geoObjects.add(route);
+
+        document.getElementById('routeInfo').style.display = 'block';
+        document.getElementById('orderId').textContent = order.id;
+        document.getElementById('eta').textContent = route.getHumanLength();
+    }
+
+    document.getElementById('openOrderPanel').addEventListener('click', () => {
+        document.getElementById('orderPanel').style.display = 'block';
+    });
+
+</script>
+</body>
+</html>
